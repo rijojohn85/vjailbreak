@@ -505,18 +505,18 @@ func (osclient *OpenStackClients) CreatePort(network *networks.Network, mac, ip,
 
 	if ip != "" {
 		PrintLog(fmt.Sprintf("Subnets in network  : %v", network.Subnets))
-		
+
 		subnet, err := osclient.GetSubnet(network.Subnets, ip)
 		fixedIP := []ports.IP{}
-		if err != nil  && !fallbackToDHCP {
+		if err != nil && !fallbackToDHCP {
 			return nil, fmt.Errorf("failed to get subnet: %s", err)
 		}
-		
-		if subnet != nil{				
+
+		if subnet != nil {
 			fixedIP = append(fixedIP, ports.IP{
-			SubnetID:  subnet.ID,
-			IPAddress: ip,
-		    })
+				SubnetID:  subnet.ID,
+				IPAddress: ip,
+			})
 		}
 		createOpts.FixedIPs = fixedIP
 	}
@@ -562,13 +562,38 @@ func (osclient *OpenStackClients) CreateVM(flavor *flavors.Flavor, networkIDs, p
 	if uuid == "" {
 		return nil, fmt.Errorf("unable to determine boot volume for VM: %s", vminfo.Name)
 	}
+
 	PrintLog(fmt.Sprintf("OPENSTACK API: Creating VM %s, authurl %s, tenant %s with flavor %s in availability zone %s", vminfo.Name, osclient.AuthURL, osclient.Tenant, flavor.ID, availabilityZone))
+
+	// ============ IMPROVEMENT 1: Set Microversion Early ============
+	// Set microversion BEFORE creating any block devices if VM has RDM disks
+	if len(vminfo.RDMDisks) > 0 {
+		osclient.ComputeClient.Microversion = "2.60"
+		PrintLog(fmt.Sprintf("DEBUG: Set Nova API microversion to 2.60 (required for RDM/SCSI LUN support, VM has %d RDM disk(s))", len(vminfo.RDMDisks)))
+	} else {
+		PrintLog("DEBUG: No RDM disks, using default Nova API microversion")
+	}
+	// ================================================================
+
+	// ============ LOG: Boot Disk Identification ============
+	PrintLog(fmt.Sprintf("DEBUG: Boot disk identified - Index: %d, Volume UUID: %s", bootableDiskIndex, uuid))
+	// =======================================================
+
+	// ============ IMPROVEMENT 2: Explicit BootIndex ============
 	blockDevice := bootfromvolume.BlockDevice{
 		DeleteOnTermination: false,
 		DestinationType:     bootfromvolume.DestinationVolume,
 		SourceType:          bootfromvolume.SourceVolume,
 		UUID:                uuid,
+		BootIndex:           0, // Explicitly set to 0 for primary boot device
 	}
+	// ===========================================================
+
+	// ============ LOG: Boot BlockDevice Created ============
+	PrintLog(fmt.Sprintf("DEBUG: Boot BlockDevice created - UUID: %s, BootIndex: %d, SourceType: %s, DestType: %s, DeleteOnTerm: %v",
+		blockDevice.UUID, blockDevice.BootIndex, blockDevice.SourceType, blockDevice.DestinationType, blockDevice.DeleteOnTermination))
+	// =======================================================
+
 	// Create the server
 	openstacknws := []servers.Network{}
 	for idx := range networkIDs {
@@ -603,56 +628,133 @@ func (osclient *OpenStackClients) CreateVM(flavor *flavors.Flavor, networkIDs, p
 			serverCreateOpts.Metadata = map[string]string{}
 		}
 		serverCreateOpts.Metadata["hw_scsi_reservations"] = "true"
+		PrintLog("DEBUG: Set hw_scsi_reservations=true metadata for SCSI persistent reservations")
 	}
+
 	createOpts := bootfromvolume.CreateOptsExt{
 		CreateOptsBuilder: serverCreateOpts,
 		BlockDevice:       []bootfromvolume.BlockDevice{blockDevice},
 	}
 
-	for _, disk := range vminfo.RDMDisks {
-		// Set the Nova API version to 2.6
+	// ============ LOG: Processing RDM Disks ============
+	if len(vminfo.RDMDisks) > 0 {
+		PrintLog(fmt.Sprintf("DEBUG: Processing %d RDM disk(s) for VM", len(vminfo.RDMDisks)))
+	}
+	// ===================================================
+
+	for idx, disk := range vminfo.RDMDisks {
+		// Microversion already set above, but keeping this for safety (idempotent)
 		osclient.ComputeClient.Microversion = "2.60"
-		blockDevice := bootfromvolume.BlockDevice{
+
+		rdmBlockDevice := bootfromvolume.BlockDevice{
 			DeleteOnTermination: false,
 			DestinationType:     bootfromvolume.DestinationVolume,
 			SourceType:          bootfromvolume.SourceVolume,
 			UUID:                disk.Status.CinderVolumeID,
 			DeviceType:          "lun",
 			DiskBus:             "scsi",
-			BootIndex:           -1,
+			BootIndex:           -1, // Explicitly non-bootable
 		}
-		createOpts.BlockDevice = append(createOpts.BlockDevice, blockDevice)
+
+		// ============ LOG: RDM BlockDevice Created ============
+		PrintLog(fmt.Sprintf("DEBUG: RDM disk [%d] BlockDevice created - UUID: %s, BootIndex: %d, DeviceType: %s, DiskBus: %s",
+			idx, rdmBlockDevice.UUID, rdmBlockDevice.BootIndex, rdmBlockDevice.DeviceType, rdmBlockDevice.DiskBus))
+		// ======================================================
+
+		createOpts.BlockDevice = append(createOpts.BlockDevice, rdmBlockDevice)
 	}
 
+	// ============ IMPROVEMENT 3: Comprehensive Logging ============
+	// Log the complete BlockDevice array
+	PrintLog(fmt.Sprintf("DEBUG: Total BlockDevices to be sent to Nova: %d", len(createOpts.BlockDevice)))
+	for i, bd := range createOpts.BlockDevice {
+		PrintLog(fmt.Sprintf("DEBUG: BlockDevice[%d] - UUID: %s, BootIndex: %d, DeviceType: '%s', DiskBus: '%s', SourceType: %s, DestType: %s",
+			i, bd.UUID, bd.BootIndex, bd.DeviceType, bd.DiskBus, bd.SourceType, bd.DestinationType))
+	}
+
+	// Log the full JSON payload being sent to Nova
+	payloadMap, err := createOpts.ToServerCreateMap()
+	if err != nil {
+		PrintLog(fmt.Sprintf("ERROR: Failed to convert createOpts to map for logging: %v", err))
+	} else {
+		// Marshal to JSON for readable output
+		payloadJSON, err := json.MarshalIndent(payloadMap, "", "  ")
+		if err != nil {
+			PrintLog(fmt.Sprintf("ERROR: Failed to marshal payload to JSON for logging: %v", err))
+		} else {
+			PrintLog(fmt.Sprintf("DEBUG: Full Nova API Payload:\n%s", string(payloadJSON)))
+		}
+	}
+
+	PrintLog(fmt.Sprintf("DEBUG: Calling Nova servers.Create API with microversion: '%s'", osclient.ComputeClient.Microversion))
+	// ==============================================================
+
 	// Wait for disks to become available
-	for _, disk := range vminfo.VMDisks {
+	PrintLog("DEBUG: Waiting for all volumes to become available before creating server")
+	for idx, disk := range vminfo.VMDisks {
+		PrintLog(fmt.Sprintf("DEBUG: Waiting for volume %d (%s) to be available", idx, disk.OpenstackVol.ID))
 		err := osclient.WaitForVolume(disk.OpenstackVol.ID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to wait for volume to become available: %s", err)
 		}
 	}
+	PrintLog("DEBUG: All volumes are available, proceeding with server creation")
 
 	server, err := servers.Create(osclient.ComputeClient, createOpts).Extract()
 	if err != nil {
+		// ============ LOG: Server Creation Failed ============
+		PrintLog(fmt.Sprintf("ERROR: Nova server creation failed: %v", err))
+		// =====================================================
 		return nil, fmt.Errorf("failed to create server: %s", err)
 	}
 
+	// ============ LOG: Server Created Successfully ============
+	PrintLog(fmt.Sprintf("DEBUG: Nova server created successfully - Server ID: %s, Status: %s", server.ID, server.Status))
+
+	// Log the server response details (optional, can be verbose)
+	serverJSON, jsonErr := json.MarshalIndent(server, "", "  ")
+	if jsonErr == nil {
+		PrintLog(fmt.Sprintf("DEBUG: Nova Server Response:\n%s", string(serverJSON)))
+	} else {
+		PrintLog(fmt.Sprintf("DEBUG: Could not marshal server response to JSON: %v", jsonErr))
+	}
+	// ==========================================================
+
+	PrintLog(fmt.Sprintf("DEBUG: Waiting for server %s to reach ACTIVE status (timeout: %d seconds)",
+		server.ID, vjailbreakSettings.VMActiveWaitRetryLimit*vjailbreakSettings.VMActiveWaitIntervalSeconds))
+
 	err = servers.WaitForStatus(osclient.ComputeClient, server.ID, "ACTIVE", vjailbreakSettings.VMActiveWaitRetryLimit*vjailbreakSettings.VMActiveWaitIntervalSeconds)
 	if err != nil {
+		// ============ LOG: Server Failed to Reach ACTIVE ============
+		PrintLog(fmt.Sprintf("ERROR: Server %s failed to reach ACTIVE status: %v", server.ID, err))
+		// ============================================================
 		return nil, fmt.Errorf("failed to wait for server to become active: %s", err)
 	}
 
+	PrintLog(fmt.Sprintf("DEBUG: Server %s is now ACTIVE", server.ID))
+
 	PrintLog(fmt.Sprintf("Server created with ID: %s, Attaching Additional Disks", server.ID))
 
-	for _, disk := range append(vminfo.VMDisks[:bootableDiskIndex], vminfo.VMDisks[bootableDiskIndex+1:]...) {
+	// Attach additional non-boot disks
+	additionalDisks := append(vminfo.VMDisks[:bootableDiskIndex], vminfo.VMDisks[bootableDiskIndex+1:]...)
+	if len(additionalDisks) > 0 {
+		PrintLog(fmt.Sprintf("DEBUG: Attaching %d additional disk(s) to server", len(additionalDisks)))
+	}
+
+	for idx, disk := range additionalDisks {
+		PrintLog(fmt.Sprintf("DEBUG: Attaching additional disk %d - Volume ID: %s", idx, disk.OpenstackVol.ID))
 		_, err := volumeattach.Create(osclient.ComputeClient, server.ID, volumeattach.CreateOpts{
 			VolumeID:            disk.OpenstackVol.ID,
 			DeleteOnTermination: false,
 		}).Extract()
 		if err != nil {
+			PrintLog(fmt.Sprintf("ERROR: Failed to attach volume %s to VM: %v", disk.OpenstackVol.ID, err))
 			return nil, fmt.Errorf("failed to attach volume to VM: %s", err)
 		}
+		PrintLog(fmt.Sprintf("DEBUG: Successfully attached volume %s", disk.OpenstackVol.ID))
 	}
+
+	PrintLog(fmt.Sprintf("DEBUG: VM creation completed successfully - Server ID: %s", server.ID))
 	return server, nil
 }
 
