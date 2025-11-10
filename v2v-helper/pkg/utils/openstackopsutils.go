@@ -565,16 +565,6 @@ func (osclient *OpenStackClients) CreateVM(flavor *flavors.Flavor, networkIDs, p
 
 	PrintLog(fmt.Sprintf("OPENSTACK API: Creating VM %s, authurl %s, tenant %s with flavor %s in availability zone %s", vminfo.Name, osclient.AuthURL, osclient.Tenant, flavor.ID, availabilityZone))
 
-	// ============ IMPROVEMENT 1: Set Microversion Early ============
-	// Set microversion BEFORE creating any block devices if VM has RDM disks
-	if len(vminfo.RDMDisks) > 0 {
-		osclient.ComputeClient.Microversion = "2.60"
-		PrintLog(fmt.Sprintf("DEBUG: Set Nova API microversion to 2.60 (required for RDM/SCSI LUN support, VM has %d RDM disk(s))", len(vminfo.RDMDisks)))
-	} else {
-		PrintLog("DEBUG: No RDM disks, using default Nova API microversion")
-	}
-	// ================================================================
-
 	// ============ LOG: Boot Disk Identification ============
 	PrintLog(fmt.Sprintf("DEBUG: Boot disk identified - Index: %d, Volume UUID: %s", bootableDiskIndex, uuid))
 	// =======================================================
